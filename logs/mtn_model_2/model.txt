@@ -1,0 +1,1 @@
+Model with alpha=0.15, per-epoch initialisation, fluctuations present
