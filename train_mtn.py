@@ -41,8 +41,10 @@ class MTNFCTrainer:
         
         self.dpmodel = nn.DataParallel(model)
         self.dpmodel.train()
-        # self.initial_losses = 0.0
-        self.initial_losses = torch.log(torch.tensor(self.model.stn_targets, dtype=torch.float, device='cuda'))
+        self.initial_losses = 0.0
+        
+        # log(C) init
+        # self.initial_losses = torch.log(torch.tensor(self.model.stn_targets, dtype=torch.float, device='cuda'))
         
         self.best_loss = float('inf')
     
@@ -156,8 +158,9 @@ class MTNFCTrainer:
         norms = torch.stack(norms)
         
         # set L(0)
-        # if t == 0:
-            # self.initial_losses = task_losses.detach()
+        # if using log(C) init, remove these two lines
+        if t == 0:
+            self.initial_losses = task_losses.detach()
         
         # compute the constant term without accumulating gradients
         # as it should stay constant during back-propagation
