@@ -18,12 +18,13 @@ class SoftCrossEntropyLoss(nn.Module):
 
 class MTNFCTrainer:
     
-    def __init__(self, model, optimizer, batch_size,
+    def __init__(self, model, optimizer, gradnorm_optimizer, batch_size,
                  weights, target_names, criterions,
                  alpha, logger, epochs, validate_every):
         
         self.model = model
         self.optimizer = optimizer
+        self.gradnorm_optimizer = gradnorm_optimizer
         self.batch_size = batch_size
         
         self.weights = weights
@@ -135,35 +136,24 @@ class MTNFCTrainer:
         weighted_losses = self.weights * task_losses
         total_weighted_loss = weighted_losses.sum()
         
-        self.optimizer.zero_grad()
-        
-        # compute and retain gradients
-        total_weighted_loss.backward(retain_graph=True)
-        
         # GRADNORM - learn the weights for each tasks gradients
         
-        # zero the w_i(t) gradients since we want to update the weights using gradnorm loss
-        self.weights.grad = 0.0 * self.weights.grad
-        
-        W = list(self.model.mtn.shared_block.parameters())
-        norms = []
-        
-        for w_i, L_i in zip(self.weights, task_losses):
-            # gradient of L_i(t) w.r.t. W
-            gLgW = torch.autograd.grad(L_i, W, retain_graph=True)
-            
-            # G^{(i)}_W(t)
-            norms.append(torch.norm(w_i * gLgW[0]))
-        
-        norms = torch.stack(norms)
+        # last layer of shared weights
+        W = next(self.model.mtn.shared_block.parameters())
+        T = self.weights.size(0)
+
+        # gradient of L_i(t) w.r.t. W
+        gLgW = torch.stack([torch.autograd.grad(L_i, W, retain_graph=True)[0] for L_i in task_losses], dim=0)
+
+        # G^{(i)}_W(t)
+        norms = torch.sum((self.weights[:, None] * gLgW.view(T, -1)) ** 2, dim=-1) ** 0.5
         
         # set L(0)
         # if using log(C) init, remove these two lines
         if t == 0:
             self.initial_losses = task_losses.detach()
         
-        # compute the constant term without accumulating gradients
-        # as it should stay constant during back-propagation
+        # compute the constant term
         with torch.no_grad():
             
             # loss ratios \curl{L}(t)
@@ -177,17 +167,18 @@ class MTNFCTrainer:
         # write out the gradnorm loss L_grad and set the weight gradients
         grad_norm_loss = (norms - constant_term).abs().sum()
         self.weights.grad = torch.autograd.grad(grad_norm_loss, self.weights)[0]
+        self.gradnorm_optimizer.step()
         
-        # apply gradient descent
+        # GRADNORM END
+        
+        # normal backward pass and step
+        self.optimizer.zero_grad()
+        total_weighted_loss.backward()
         self.optimizer.step()
         
         # renormalize the gradient weights
         with torch.no_grad():
-            
-            normalize_coeff = len(self.weights) / self.weights.sum()
-            self.weights.data = self.weights.data * normalize_coeff
-        
-        # GRADNORM END
+            self.weights.data = self.weights / self.weights.sum() * T
         
         # LOG PROGRESS
         
@@ -213,11 +204,11 @@ if __name__ == '__main__':
     model = MTNFC(mtn=mtn, stn_targets=[C, 40, 40, 40, 40]).cuda()
     
     # weights for GradNorm
-    weights = nn.Parameter(torch.ones(5, requires_grad=True, device='cuda'))
+    weights = torch.ones(5, requires_grad=True, device='cuda')
     
     # set differnent learning rate for GradNorm weights, and no weight decay
-    optimizer = torch.optim.Adam([{'params': model.parameters(), 'lr': 1e-4, 'weight_decay': 1e-5},
-                                  {'params': weights, 'lr': 1e-3}])
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    gradnorm_optimizer = torch.optim.Adam(weights, lr=1e-3)
     
     logger = ModelLogger(['epoch', 'iteration', 'total_weighted_loss', 'grad_norm_loss',
                           *(name + '_weight' for name in target_names),
